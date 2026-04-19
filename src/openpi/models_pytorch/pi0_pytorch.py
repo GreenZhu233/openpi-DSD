@@ -11,6 +11,16 @@ from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
 
+def max_angle_from_vt_history(v_t_history: list):
+    if not v_t_history or len(v_t_history) < 2:
+        return None
+
+    v_t_history = torch.stack(list(map(Tensor.flatten, v_t_history)))
+    cos_sim = F.cosine_similarity(v_t_history[:-1], v_t_history[1:], dim=1)
+    angles = torch.rad2deg(torch.acos(torch.clamp(cos_sim, -1.0, 1.0)))
+    return float(torch.max(angles))
+
+
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
     if device_type == "cpu":
@@ -404,6 +414,7 @@ class PI0Pytorch(nn.Module):
 
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        v_t_history = []
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
             v_t = self.denoise_step(
@@ -413,10 +424,13 @@ class PI0Pytorch(nn.Module):
                 x_t,
                 expanded_time,
             )
+            if hasattr(self, "collect_v_t_angles") and self.collect_v_t_angles:
+                v_t_history.append(v_t[0].detach())
 
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
             time += dt
+        self.max_v_t_angle = max_angle_from_vt_history(v_t_history)
         return x_t
 
     def denoise_step(

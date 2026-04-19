@@ -103,6 +103,9 @@ class Policy(BasePolicy):
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
+
+        if hasattr(self._model, "collect_v_t_angles") and self._model.collect_v_t_angles:
+            outputs["max_v_t_angle"] = self._model.max_v_t_angle
         return outputs
 
     @property

@@ -4,6 +4,7 @@ import logging
 import socket
 
 import tyro
+from pathlib import Path
 
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
@@ -54,6 +55,12 @@ class Args:
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
+    # If true, the policy will collect the value function predictions at each step.
+    collect_v_t_angles: bool = False
+
+    # Number of denoising steps to run in the policy's sample_actions method. This is only used for Pytorch model.
+    denoise_steps: int = 10
+
 
 # Default checkpoints that should be used for each environment.
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
@@ -71,16 +78,17 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
     ),
     EnvMode.LIBERO: Checkpoint(
         config="pi05_libero",
-        dir="gs://openpi-assets/checkpoints/pi05_libero",
+        # dir="gs://openpi-assets/checkpoints/pi05_libero",
+        dir=Path.joinpath(Path.home(), ".cache", "openpi", "openpi-assets", "checkpoints", "pi05_libero_pytorch"),
     ),
 }
 
 
-def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
+def create_default_policy(env: EnvMode, *, default_prompt: str | None = None, denoise_steps: int) -> _policy.Policy:
     """Create a default policy for the given environment."""
     if checkpoint := DEFAULT_CHECKPOINT.get(env):
         return _policy_config.create_trained_policy(
-            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt
+            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt, sample_kwargs={"num_steps": denoise_steps}
         )
     raise ValueError(f"Unsupported environment mode: {env}")
 
@@ -90,15 +98,19 @@ def create_policy(args: Args) -> _policy.Policy:
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt, sample_kwargs={"num_steps": args.denoise_steps}
             )
         case Default():
-            return create_default_policy(args.env, default_prompt=args.default_prompt)
+            return create_default_policy(args.env, default_prompt=args.default_prompt, denoise_steps=args.denoise_steps)
 
 
 def main(args: Args) -> None:
     policy = create_policy(args)
     policy_metadata = policy.metadata
+
+    if args.collect_v_t_angles:
+        model = policy._model
+        model.collect_v_t_angles = True
 
     # Record the policy's behavior.
     if args.record:
