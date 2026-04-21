@@ -1,4 +1,5 @@
 import logging
+from functools import partial
 
 import einops
 import flax.nnx as nnx
@@ -12,6 +13,7 @@ from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
+import openpi.shared.nnx_utils as nnx_utils
 
 logger = logging.getLogger("openpi")
 
@@ -101,6 +103,9 @@ class Pi0(_model.BaseModel):
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
+
+        # Cache for JIT-compiled samplers with different num_steps
+        self._sampler_cache: dict[at.Int[at.Array, ""], callable] = {}
 
     @at.typecheck
     def embed_prefix(
@@ -213,15 +218,14 @@ class Pi0(_model.BaseModel):
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
-    @override
-    def sample_actions(
+    def _sample_actions_impl(
         self,
         rng: at.KeyArrayLike,
         observation: _model.Observation,
-        *,
-        num_steps: int | at.Int[at.Array, ""] = 10,
-        noise: at.Float[at.Array, "b ah ad"] | None = None,
+        num_steps: int,
+        noise: at.Float[at.Array, "b ah ad"] | None,
     ) -> _model.Actions:
+        """Core sampling logic with num_steps as parameter."""
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -246,10 +250,10 @@ class Pi0(_model.BaseModel):
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
             # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
             # prefix tokens
-            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            prefix_attn_mask_repeat = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
             # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
             # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
-            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+            full_attn_mask = jnp.concatenate([prefix_attn_mask_repeat, suffix_attn_mask], axis=-1)
             assert full_attn_mask.shape == (
                 batch_size,
                 suffix_tokens.shape[1],
@@ -277,3 +281,45 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    @override
+    def sample_actions(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+    ) -> _model.Actions:
+        """Sample actions with variable num_steps.
+
+        JIT compilation happens internally with caching for each num_steps value.
+
+        Args:
+            rng: Random key for noise generation.
+            observation: The observation to sample actions for.
+            num_steps: Number of diffusion steps. Must be an integer in range [1, 10].
+                Higher values produce better results but are slower.
+            noise: Optional pre-sampled noise. If None, noise is generated from rng.
+
+        Returns:
+            Sampled actions of shape (batch_size, action_horizon, action_dim).
+        """
+        # Split the model state and get graphdef for JIT compilation
+        graphdef, state = nnx.split(self)
+        
+        # Check if a JIT-compiled sampler for this num_steps already exists
+        if num_steps not in self._sampler_cache:
+            # Create a JIT-compiled function for this specific num_steps
+            def create_jitted_sampler(num_steps_val, gd):
+                def jitted_fn(state, rng, observation, noise):
+                    module = nnx.merge(gd, state)
+                    return module._sample_actions_impl(rng, observation, num_steps_val, noise)
+                return jax.jit(jitted_fn)
+            
+            jitted_sampler = create_jitted_sampler(num_steps, graphdef)
+            # Cache the JIT-compiled function
+            self._sampler_cache[num_steps] = jitted_sampler
+            logger.info(f"Compiled new sampler for num_steps={num_steps}")
+
+        return self._sampler_cache[num_steps](state, rng, observation, noise)
